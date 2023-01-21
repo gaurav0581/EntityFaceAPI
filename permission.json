@@ -1,0 +1,13 @@
+[
+{
+  "URL": "/generateclaim",
+  "METHOD": "POST",
+  "ROLES": ["*:INVENTORY","MANAGER:*"], 
+  "AndPermission":[],
+  "OrPermission":[],
+  "Exception": [],
+  "SuperPermission": ["SYSCON"],
+  "includeRoles":true,
+  "IncludeModulePermissions":[]
+  }
+]
