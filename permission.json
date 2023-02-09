@@ -1,8 +1,30 @@
 [
 {
-  "URL": "/generateclaim",
+  "URL": "/entityface/category/add",
   "METHOD": "POST",
   "ROLES": ["*:INVENTORY","MANAGER:*"], 
+  "AndPermission":[],
+  "OrPermission":[],
+  "Exception": [],
+  "SuperPermission": ["SYSCON"],
+  "includeRoles":true,
+  "IncludeModulePermissions":[]
+  },
+  {
+  "URL": "/entityface/face/add",
+  "METHOD": "POST",
+  "ROLES": ["*:INVENTORY","MANAGER:*"],
+  "AndPermission":[],
+  "OrPermission":[],
+  "Exception": [],
+  "SuperPermission": ["SYSCON"],
+  "includeRoles":true,
+  "IncludeModulePermissions":[]
+  },
+  {
+  "URL": "/entityface/face/find",
+  "METHOD": "POST",
+  "ROLES": ["*:INVENTORY","MANAGER:*"],
   "AndPermission":[],
   "OrPermission":[],
   "Exception": [],

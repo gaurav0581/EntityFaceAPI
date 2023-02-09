@@ -7,9 +7,11 @@ from aioredis.client import PubSub, Redis
 from sklearn.cluster import KMeans,AgglomerativeClustering
 from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException, Header,Response,Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.future import select
 from sqlalchemy import create_engine
 import _pickle as pickle
 import redis
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 import json
 import schema
@@ -35,15 +37,15 @@ engine = create_async_engine(
             future=True,
             echo=True
         )
-#engine = create_engine(os.environ['DATABASE_URI'])
+
 SessionLocal = sessionmaker(bind= engine ,expire_on_commit=False, class_=AsyncSession)
 rediscommandsubs='EmbeddingCommandQueue'
 pool=aioredis.ConnectionPool.from_url(f'redis://127.0.0.1:6379/0', encoding="utf-8", decode_responses=True)
 mediods = {}
-facethreshold=7
-
-def db_connect():
-    return engine.connect()
+facethreshold=float(os.environ['facethreshold'])
+maxcluster = int(os.environ['maxcluster'])
+maxbatch = int(os.environ['maxbatch'])
+minbatch = int(os.environ['minbatch'])
 
 celery = Celery(
     __name__,
@@ -56,10 +58,10 @@ def db_engine():
         db = SessionLocal()
         yield db
     finally:
-        db.close()
+         db.close()
 
 app = FastAPI()
-#app.add_middleware(SecureAPIMiddleware, some_attribute="some_attribute_here_if_needed")
+app.add_middleware(SecureAPIMiddleware, some_attribute="some_attribute_here_if_needed")
 
 @app.on_event("startup")
 async def onstart():
@@ -71,20 +73,25 @@ async def onstart():
             if message:
               try:
                 data = json.loads(message['data'])
-                if data['OP']=='CREATE':
+                if data['op']=='CREATE':
                     pipe = await conn.pipeline()
-                    pipe.lpush('embedding:' + data['part'], *data.embedding)
-                    pipe.lpush('id:' + data['part'], str(data['id']) + ':' + data.processIdentifier)
-                    pipe.execute()
-                if data['OP']=='DELETE':
+                    await pipe.rpush('embedding:' + data['part'], *data['embedding'])
+                    await pipe.rpush('id:' + data['part'], str(data['id']) + ':' + data['processIdentifier'])
+                    await pipe.execute()
+                if data['op']=='DELETE':
                     #to implement in redis lua
-                    l=conn.lpos('id:' + data['part'], str(data['id']) + ':' + data.processIdentifier)
+                    l=conn.lpos('id:' + data['part'], str(data['id']) + ':' + data['processIdentifier'])
                     k=conn.lrange('embedding:'+ data['part'],0,-1)
                     del(k[l*data['size']:(l+1)*data['size']])
                     pipe = await conn.pipeline()
                     pipe.delete('embedding:'+ data['part'])
                     pipe.rpush('embedding:'+ data['part'],*k)
                     pipe.lrem('id:'+ data['part'], str(data['id']) + ':' + data.processIdentifier)
+                if data['op']=='CLUSTER':
+                    if data['category']:
+                       ClusterPartition.delay(data['category'],data['entity'])
+                    else:
+                        ClusterPartitionBatch.delay()
 #                    pipe.ltrim('embedding:'+str(data['size'])+':'+ data['part'],l*data['size'],(l+1)*data['size'])
               except Exception as e:
                   print(e)
@@ -101,28 +108,31 @@ async def onstart():
     #load two lua redis command to find face and delete
 
 @app.post("/entityface/category/add", response_model=schema.addCategory)
-async def addCategory(data: schema.addCategory,request: Request, db: Session = Depends(db_engine),conn=Depends(db_connect)):
+async def addCategory(data: schema.addCategory,request: Request, db: AsyncSession = Depends(db_engine)):
     headers = get_header(request)
-    q = await db.query(models.Category).filter(models.Category.entity == headers[3]).all()
+    query = select(models.Category).where(models.Category.entity == headers['entity'])
+    q=(await db.execute(query)).scalars().all()
+#    q = await db.query(models.Category).filter(models.Category.entity == headers[3]).all()
     if not q:
-       query = "CREATE TABLE " + str(headers[3]) + " PARTITION OF Face FOR VALUES IN ('" + str(headers[3]) + "')"
-       await conn.execute(query)
-    else:
-      temp1=True
-      for q1 in q:
+       query = "CREATE TABLE if not exists " + 'ENT'+str(headers['entity']) + " PARTITION OF Face FOR VALUES IN ("+ str(headers['entity'])+")"
+       await (await engine.connect()).execute(text(query))
+       #tmp=(await db.execute(text(query)))
+
+    temp1=True
+    for q1 in q:
         if q1.name==data.name:
             temp1=False
             break
-      if temp1:
-           temp=[{"User": headers[0],"BUSINESS": headers[2],"ACTION":"ADD","TS": datetime.datetime.now().strftime('%m%d%y%H%M%S')}]
-           db_user = models.Category(name=data.name,updateInfo=json.dumps(temp),entity=str(headers[3]),model=data.model,embeddingLength=data.embeddingLength )
+    if temp1:
+           temp=[{"User": headers['user'],"ACTION":"ADD","TS": datetime.now().strftime('%m%d%y%H%M%S')}]
+           db_user = models.Category(name=data.name,updateInfo=json.dumps(temp),entity=headers['entity'],model=data.model,embeddingLength=data.embeddingLength )
            db.add(db_user)
            await db.commit()
            await db.refresh(db_user)
+           await db.close()
            return db_user
-      else:
+    else:
           return JSONResponse(status_code=501, content={'status': 'Already Exist'})
-
 
 @app.post("/face/partition")
 async def partitionFace(request: Request):
@@ -134,30 +144,33 @@ async def partitionFace(request: Request):
       status=ClusterPartition.delay(body[category]=='*')
     return JSONResponse(status_code=204, content={'batchid': status})
 
-
-@app.post("/face/find")
-async def findFace(data: schema.findface,request: Request, db: Session = Depends(db_engine)):
+@app.post("/entityface/face/find")
+async def findFace(data: schema.findface,request: Request):
     headers = get_header(request)
-    partition= headers[3] + ':' +findpartition(mediods[headers[3]],data.embedding)
+    partition=str(headers['entity'])+data.category
+    if partition in mediods:
+       partition= partition + ':' +findpartition(mediods[partition],data.embedding)
     redist = await aioredis.Redis(connection_pool=pool)
     return await findMatch(partition,data,redist)
 
+
 async def findMatch(partition,data:schema.findface,redist):
     t = len(data.embedding)
-    embedding=redist.lrange('embedding:' +partition, 0, -1)
+    embedding=await redist.lrange('embedding:'+partition, 0, -1)
     temp=schema.findfaceResult(matched=[],unmatched=[])
-    id=redist.lrange('id:'+partition, 0, -1)
+    id=await redist.lrange('id:'+partition, 0, -1)
     distance=[]
     thresindex=-1
     for i in range(len(id)):
-        dist=findEuclideanDistanceArray(embedding[i*t:(i+1)*t],data.embedding)
+        temp1 = [float(k) for k in embedding[i*t:(i+1)*t]]
+        dist=findEuclideanDistanceArray(temp1,data.embedding)
         ins=False
-        for j in range[len(distance)]:
+        for j in range(len(distance)):
             if dist<distance[j][0]:
                 distance.insert(j,(dist,id[i]))
                 ins=True
                 break
-        if ins:
+        if not ins:
             distance.append((dist, id[i]))
         if dist <= facethreshold:
             thresindex = thresindex + 1
@@ -175,46 +188,58 @@ def findpartition(med,embedding):
         category=findpartition(med[i][2],embedding)
     return str(i)+':'+category
 
-@app.post("/face/add")
+@app.post("/entityface/face/add")
 async def addFace(data: schema.addFace,request: Request, db: Session = Depends(db_engine)):
     existing=False
     headers = get_header(request)
     if not len(data.embedding)/data.embedding_size==len(data.images):
         return JSONResponse(status_code=501, content={'reason': "invalid data"})
     try:
-      category = await db.query(models.Category).get(headers[3])
+      query = select(models.Category).where(models.Category.name == data.category and models.Category.entity == headers['entity'])
+      category = (await db.execute(query)).scalar()
     except:
         return JSONResponse(status_code=501, content={'reason': "invalid category"})
+    if not (category.model==data.model and category.embeddingLength==data.embedding_size):
+        return JSONResponse(status_code=501, content={'reason': "invalid category"})
     if data.id!=None:
-       q = await db.query(models.Face).filter(models.Face.category_name==headers[3] and models.Face.id == data.id ).first()
+       select(models.Face).where(models.Face.category_name == data.category and models.Face.id == data.id)
+       q = await db.execute(query)
        if q:
            existing=True
     if not existing:
-        q = models.Face(category_name=headers[3],status = 'ADD',processIdentifier = data.processIdentifier)
+        q = models.Face(category_name=data.category,entity=headers['entity'],status = 'ADD',processIdentifier = data.processIdentifier)
         q.embedding = []
         q.images = []
         q.processInfo=[]
         q.updateInfo=[]
+        q.redisPartitionKey=[]
+    i=0
     for im in data.images:
        q.images.append(base64.b64decode(im.encode("utf-8")))
     q.embedding.extend(data.embedding)
     q.embedding_size=data.embedding_size
     q.processInfo.append(data.processInfo)
-    q.updateInfo.append({"User": headers[0],"BUSINESS": headers[2],"ACTION":"ADD","TS": datetime.datetime.now().strftime('%m%d%y%H%M%S')})
+    q.updateInfo.append({"User": headers['user'],"ACTION":"ADD","TS": datetime.now().strftime('%m%d%y%H%M%S')})
     db.add(q)
     await db.commit()
     await db.refresh(q)
-    if data.realtime:
-        partition = headers[3] + ':' + findpartition(mediods[headers[3]], data.embedding)
-        redist = await aioredis.Redis(connection_pool=pool)
-        publishRedisCommand(redist, 'create', data, partition)
+    for im in data.images:
+       if data.realtime:
+           partition = str(headers['entity']) + data.category
+           if partition in mediods.keys():
+               partition = partition + ':' + findpartition(mediods[partition], data.embedding[i*data.embedding_size:(i+1)*data.embedding_size])
+           redist = await aioredis.Redis(connection_pool=pool)
+           q.redisPartitionKey.append(str(len(q.images) - 1) + '#' + partition)
+           await publishRedisCommand(redist, 'CREATE', q, partition)
+           i=i+1
     return {"id":q.id}
 
-def publishRedisCommand(redist,op,data,partition):
-    cmdData={'op':op,'part':partition,'size':data.embedding_size}
-    if op=='create':
+async def publishRedisCommand(redist,op,data,partition):
+    cmdData={'op':op,'part':partition,'size':data.embedding_size,'processIdentifier':data.processIdentifier,'id':str(data.id)}
+    if op=='CREATE':
         cmdData['embedding']=data.embedding
-    redist.publish(rediscommandsubs,json.dumps(cmdData))
+    await redist.publish(rediscommandsubs,json.dumps(cmdData))
+    print("command published")
     return
 
 def findEuclideanDistance(source_representation, test_representation):
@@ -237,19 +262,17 @@ async def ClusterPartitionBatch():
     db = db_engine()
     category = await db.query(models.Category).all()
     print("cluster partition batch triggered")
-    embedding_size=128
     for cat in category:
-        ClusterPartition.delay(cat.name,cat.entity,embedding_size)
+        ClusterPartition.delay(cat.name,cat.entity)
 
 @celery.task
-async def ClusterPartition(category,entity,embedding_size):
+async def ClusterPartition(cat,entity):
     db=db_engine()
-    q = await db.query(models.Face).filter(models.Face.category_name == category and models.Face.status == 'ACTIVE' and models.Face.embedding_size== embedding_size and models.Face.entity==entity)
-    cluster_name = entity+category
+    query = select(models.Category).where(models.Category.entity == entity and models.Category.name == cat)
+    category = (await db.execute(query)).first()
+    q = await db.query(models.Face).filter(models.Face.category_name == category.name and models.Face.status == 'ACTIVE' and models.Face.embedding_size == category.embedding_size and models.Face.entity==category.entity)
+    cluster_name = str(category.entity)+category.name
     level = 0
-    maxcluster = 2
-    maxbatch = 50
-    minbatch = 10
     all_object = q.all()
     redist = redis.Redis(
         host='127.0.0.1',
@@ -313,47 +336,41 @@ def cluster_div(all_object,cluster_name,maxbatch,maxcluster,minbatch,redist):
          mediod=cluster_div(clusterlist[ind],cluster_name+':'+str(ind),maxbatch,maxcluster,minbatch,redist)
          med.append(mediod)
          if not mediod:
-           redis_object=[]
            redis_embedding=[]
            cluster_id=[]
            for ob in clusterlist[ind]:
-              redis_object.append({"id": ob.id, "embedding": ob.embedding, "processId": ob.processIdentifier})
               ob.status = "LISTED"
               cluster_id.append(str(ob.id)+'::'+ob.processIdentifier)
               redis_embedding.extend(ob.embedding)
-              ob.redisPartitionKey='id:' + cluster_name + ':' + str(ind)
+              ob.redisPartitionKey.append(cluster_name + ':' + str(ind))
            print(cluster_name + ':' + str(ind) + '=' + str(len(redis_object))+' branchend')
- #          redist.set(cluster_name + ':' + str(ind), pickle.dumps(redis_object))
            redist.rpush('embedding:'+cluster_name + ':' + str(ind),*redis_embedding)
            redist.rpush('id:'+cluster_name + ':' + str(ind),*cluster_id)
+           redis_object = {'id':cluster_id,'embedding':redis_embedding}
            filename=('backup/' + cluster_name + ':' + str(ind) + '.pickle').replace(':','&')
            with open(filename, 'wb') as handle:
                pickle.dump(redis_object, handle)
-           print('cluster:'+'id:'+cluster_name + ':' + str(ind) +'::' + len(redis_object))
            if (len(redis_object) > maxbatch + minbatch) or len(redis_object) < minbatch:
-               print("Limit Exceeded")
+              print(filename+':: clustering not within defined limit')
       else:
-          redis_object=[]
           redis_embedding = []
           cluster_id = []
           for ob in clusterlist[ind]:
-             redis_object.append({"id":ob.id,"embedding":ob.embedding,"processId":ob.processIdentifier})
              ob.status="LISTED"
              cluster_id.append(str(ob.id) + '::' + ob.processIdentifier)
              redis_embedding.extend(ob.embedding)
-             ob.redisPartitionKey = cluster_name + ':' + str(ind)
-          #redist.set(cluster_name+':'+str(ind),pickle.dumps(redis_object))
-          redist.rpush('embedding:'+ cluster_name + ':' + str(ind),*redis_embedding)
-          redist.rpush('id:'+cluster_name + ':' + str(ind),*cluster_id)
+             ob.redisPartitionKey.append(cluster_name + ':' + str(ind))
+          redist.rpush('embedding:'+str(clusterlist[ind][0].embedding_size)+':' + cluster_name + ':' + str(ind),*redis_embedding)
+          redist.rpush('id:'+str(clusterlist[ind][0].embedding_size)+':' + cluster_name + ':' + str(ind),*cluster_id)
           filename = ('backup/' + cluster_name + ':' + str(ind) + '.pickle').replace(':', '&')
+          redis_object = {'id': cluster_id, 'embedding': redis_embedding}
           with open(filename, 'wb') as handle:
               pickle.dump(redis_object, handle)
           med.append([])
-          print('cluster:'+'id:'+cluster_name + ':' + str(ind) +'::' + len(redis_object))
+          print(cluster_name+':'+str(ind)+'='+str(len(redis_object)))
       mediods.append(med)
       ind=ind+1
   return mediods
-
 # To run locally
 if __name__ == '__main__':
     uvicorn.run(app, host='0.0.0.0', port=8000)

@@ -13,6 +13,7 @@ class addCategory(BaseModel):
 
 class addFace(BaseModel):
     id: Optional[UUID]
+    category: str
     embedding : List[float]
     embedding_size : int
     model : str
@@ -39,6 +40,7 @@ class deleteFace(BaseModel):
     processIdentifier : str
 
 class findface(BaseModel):
+    category: str
     embedding: List[float]
     maxFaces: int
 

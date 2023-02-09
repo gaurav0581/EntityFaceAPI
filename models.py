@@ -19,7 +19,7 @@ class Face(Base):
         },
     )
     id  = Column( postgresql.UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    redisPartitionKey = Column(String, nullable=True)
+    redisPartitionKey = Column(postgresql.ARRAY(String))
     processIdentifier = Column(String)
     embedding = Column(postgresql.ARRAY(sqlalchemy.Float))
     processInfo = Column( postgresql.JSON(), nullable=True)
@@ -28,13 +28,13 @@ class Face(Base):
     status = Column(String)
     images = Column(postgresql.ARRAY(postgresql.BYTEA))
     createTS = Column(DateTime(timezone=True), server_default=func.now())
-    entity = Column(String,primary_key=True)
+    entity = Column(Integer,primary_key=True)
     category_name = Column(String)
 
 class Category(Base):
     __tablename__ = 'category'
     name = Column(String, primary_key=True)
-    entity = Column(String, primary_key=True)
+    entity = Column(Integer, primary_key=True)
     model =Column(String)
     embeddingLength=Column(Integer)
     Info = Column( postgresql.JSON(), nullable=True)
